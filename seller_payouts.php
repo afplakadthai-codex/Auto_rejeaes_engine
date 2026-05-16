@@ -100,6 +100,20 @@ if ($sbAvailable) {
     require_once $_sbHelper;
 }
 
+// ── 5b. Load seller balance release engine for monitor-only dry runs ─────────
+$_releaseEngine    = dirname(__DIR__) . '/includes/seller_balance_release_engine.php';
+$releaseAvailable  = is_file($_releaseEngine);
+$releaseLoadError  = '';
+if ($releaseAvailable) {
+    try {
+        require_once $_releaseEngine;
+    } catch (Throwable $e) {
+        $releaseAvailable = false;
+        $releaseLoadError = $e->getMessage();
+    }
+}
+
+
 // ── 6. Local helpers ──────────────────────────────────────────────────────────
 if (!function_exists('h')) {
     function h($v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
@@ -287,6 +301,19 @@ if (!function_exists('status_badge_class')) {
         return 'badge-secondary';
     }
 }
+
+if (!function_exists('bv_sp_first_value')) {
+    function bv_sp_first_value(array $row, array $keys, string $fallback = ''): string
+    {
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $row) && $row[$key] !== null && $row[$key] !== '') {
+                return (string)$row[$key];
+            }
+        }
+        return $fallback;
+    }
+}
+
 
 // ── CSRF ──────────────────────────────────────────────────────────────────────
 if (empty($_SESSION['_csrf_admin_seller_payouts']['actions'])) {
@@ -518,16 +545,32 @@ $hasCancel         = $sbAvailable && $hasPayoutsTable && $prHasRequestId && $prH
 $hasMarkPaid       = $sbAvailable && $hasPayoutsTable && $prHasRequestId && $prHasStatus && $isSuperAdmin && function_exists('bv_seller_balance_mark_payout_paid');
 $hasReleasePending = $sbAvailable && $isSuperAdmin && function_exists('bv_seller_balance_release_pending') && function_exists('bv_seller_balance_get');
 $hasAdjustBalance  = $sbAvailable && $isSuperAdmin && function_exists('bv_seller_balance_admin_adjust');
+$hasReleaseMonitor = $releaseAvailable && function_exists('bv_seller_release_run');
 
+$autoReleasePreviewRequested = false;
+$autoReleasePreviewResult    = null;
+$autoReleasePreviewError     = '';
 // ── POST actions ──────────────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         csrf_verify();
-        if (!$sbAvailable) {
-            throw new RuntimeException('seller_balance.php helper is missing; all payout actions are disabled.');
-        }
         $action  = (string)($_POST['action'] ?? '');
         $adminId = bv_sp_admin_id();
+
+       if ($action === 'auto_release_preview') {
+            $autoReleasePreviewRequested = true;
+            if (!$hasReleaseMonitor) {
+                throw new RuntimeException('Seller balance release engine is unavailable; dry-run preview is disabled.');
+            }
+            $autoReleasePreviewResult = bv_seller_release_run([
+                'dry_run' => true,
+                'limit' => 50
+            ]);
+        } else {
+            if (!$sbAvailable) {
+                throw new RuntimeException('seller_balance.php helper is missing; all payout actions are disabled.');
+            }
+		
 
         if ($action === 'approve_request') {
             if (!$hasApprove) { throw new RuntimeException('bv_seller_balance_approve_payout() is unavailable.'); }
@@ -685,16 +728,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             throw new RuntimeException('Unknown action: ' . h($action));
         }
+		}
     } catch (Throwable $e) {
-        flash_set('error', $e->getMessage());
+        if (!empty($autoReleasePreviewRequested)) {
+            $autoReleasePreviewError = $e->getMessage();
+        } else {
+            flash_set('error', $e->getMessage());
+        }
     }
-    redirect_safe();
+    if (empty($autoReleasePreviewRequested)) {
+        redirect_safe(); 
+    }
+ 
 }
 
 // ── Read flash ────────────────────────────────────────────────────────────────
 $flash    = flash_get();
 $messages = $flash['messages'];
 $errors   = $flash['errors'];
+
+// ── Auto Release Monitor preview normalization ───────────────────────────────
+$autoReleasePreviewItems   = [];
+$autoReleasePreviewEntries = [];
+$autoReleasePreviewSummary = ['checked' => 0, 'eligible' => 0, 'released_preview' => 0, 'blocked' => 0, 'errors' => 0];
+
+if (is_array($autoReleasePreviewResult)) {
+    $autoReleasePreviewItems = is_array($autoReleasePreviewResult['items'] ?? null) ? $autoReleasePreviewResult['items'] : [];
+    $autoReleasePreviewSummary['checked'] = (int)($autoReleasePreviewResult['checked'] ?? count($autoReleasePreviewItems));
+
+    foreach ($autoReleasePreviewItems as $_item) {
+        if (!is_array($_item)) { continue; }
+        $_reason = (string)($_item['reason'] ?? '');
+        if ($_reason === 'dry_run_eligible') {
+            $autoReleasePreviewSummary['eligible']++;
+        }
+        if (!empty($_item['blocked'])) {
+            $autoReleasePreviewSummary['blocked']++;
+        }
+    }
+
+    $autoReleasePreviewSummary['released_preview'] = $autoReleasePreviewSummary['eligible'];
+    $autoReleasePreviewSummary['errors'] = count(is_array($autoReleasePreviewResult['errors'] ?? null) ? $autoReleasePreviewResult['errors'] : []);
+
+    $_entryIds = [];
+    foreach ($autoReleasePreviewItems as $_item) {
+        if (is_array($_item) && (int)($_item['entry_id'] ?? 0) > 0) {
+            $_entryIds[] = (int)$_item['entry_id'];
+        }
+    }
+    $_entryIds = array_values(array_unique($_entryIds));
+
+    if ($_entryIds && $dbAvailable && bv_sp_seller_balance_entries_exists()) {
+        try {
+            $_placeholders = implode(',', array_fill(0, count($_entryIds), '?'));
+            $_rows = bv_sp_q('SELECT * FROM seller_balance_entries WHERE id IN (' . $_placeholders . ')', $_entryIds);
+            foreach ($_rows as $_row) {
+                $autoReleasePreviewEntries[(int)($_row['id'] ?? 0)] = $_row;
+            }
+        } catch (Throwable $e) {
+            $autoReleasePreviewError = $autoReleasePreviewError ?: 'Preview loaded, but entry details could not be read: ' . $e->getMessage();
+        }
+    }
+}
+
 
 // ── Filters ───────────────────────────────────────────────────────────────────
 $filterStatus   = trim((string)($_GET['status']    ?? ''));
@@ -954,7 +1050,9 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .safety{background:#fffbeb;border:2px solid #f59e0b;border-radius:var(--r);padding:12px 16px;margin-bottom:18px}
 .safety strong{color:#92400e}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:11px;margin-bottom:22px}
+.monitor-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin:12px 0}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px}
+.monitor-note{color:var(--muted);font-size:12px;margin:8px 0 0}
 .cl{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}
 .cv{font-size:18px;font-weight:700}
 .cw{color:#d97706}.cg{color:#16a34a}.ci{color:var(--accent)}.cp{color:#7c3aed}
@@ -1015,6 +1113,70 @@ details summary{cursor:pointer;font-weight:600;font-size:13px;color:var(--accent
 <?php if (!$dbAvailable): ?><div class="alert a-err">&#128308; <strong>Database unavailable.</strong> bv_sp_pdo() returned null. Check that $pdo/$db global is set, or that the helper's bv_seller_balance_pdo() is reachable.</div><?php endif; ?>
 <?php if (!$sbAvailable): ?><div class="alert a-warn">&#9888;&#65039; <strong>seller_balance.php helper not found.</strong> All mutation actions are disabled.</div><?php endif; ?>
 <?php foreach (array_unique($loadWarnings) as $warn): ?><div class="alert a-warn">&#9888;&#65039; <?php echo h($warn); ?></div><?php endforeach; ?>
+
+<!-- Auto Release Monitor -->
+<div class="panel">
+    <div class="ph2">
+        <h2>Auto Release Monitor</h2>
+        <span class="badge badge-secondary">Dry-run only</span>
+    </div>
+    <div class="pb">
+        <form method="post" action="seller_payouts.php">
+            <input type="hidden" name="csrf_token" value="<?php echo h($_csrfToken); ?>">
+            <input type="hidden" name="action" value="auto_release_preview">
+            <button type="submit" class="bp" <?php echo $hasReleaseMonitor ? '' : 'disabled'; ?>>Dry-run Preview</button>
+        </form>
+        <p class="monitor-note">Monitoring only: this preview calls the release engine with <code>dry_run=true</code> and <code>limit=50</code>; it does not update balances.</p>
+        <?php if (!$releaseAvailable): ?>
+            <div class="alert a-warn" style="margin-top:10px">&#9888;&#65039; Seller balance release engine file is not available<?php echo $releaseLoadError !== '' ? ': ' . h($releaseLoadError) : ''; ?>; preview is disabled.</div>
+        <?php elseif (!$hasReleaseMonitor): ?>
+            <div class="alert a-warn" style="margin-top:10px">&#9888;&#65039; <code>bv_seller_release_run()</code> is unavailable; preview is disabled.</div>
+        <?php endif; ?>
+        <?php if ($autoReleasePreviewError !== ''): ?>
+            <div class="alert a-err" style="margin-top:10px">&#10060; <?php echo h($autoReleasePreviewError); ?></div>
+        <?php endif; ?>
+
+        <?php if ($autoReleasePreviewRequested && is_array($autoReleasePreviewResult)): ?>
+            <div class="monitor-cards">
+                <div class="card"><div class="cl">Checked</div><div class="cv ci"><?php echo (int)$autoReleasePreviewSummary['checked']; ?></div></div>
+                <div class="card"><div class="cl">Eligible</div><div class="cv cg"><?php echo (int)$autoReleasePreviewSummary['eligible']; ?></div></div>
+                <div class="card"><div class="cl">Released Preview</div><div class="cv cg"><?php echo (int)$autoReleasePreviewSummary['released_preview']; ?></div></div>
+                <div class="card"><div class="cl">Blocked</div><div class="cv cw"><?php echo (int)$autoReleasePreviewSummary['blocked']; ?></div></div>
+                <div class="card"><div class="cl">Errors</div><div class="cv cp"><?php echo (int)$autoReleasePreviewSummary['errors']; ?></div></div>
+            </div>
+
+            <?php if (!$autoReleasePreviewItems): ?>
+                <p class="empty">No preview items returned.</p>
+            <?php else: ?>
+                <div class="tw"><table>
+                <thead><tr><th>Entry ID</th><th>Seller ID</th><th>Order ID</th><th>Order Item ID</th><th>Amount</th><th>Status / Reason</th><th>Result</th></tr></thead>
+                <tbody>
+                <?php foreach ($autoReleasePreviewItems as $_item):
+                    if (!is_array($_item)) { continue; }
+                    $_entryId = (int)($_item['entry_id'] ?? 0);
+                    $_entry   = $autoReleasePreviewEntries[$_entryId] ?? [];
+                    $_seller  = bv_sp_first_value($_item + $_entry, ['seller_id', 'seller_user_id', 'vendor_id'], '');
+                    $_order   = bv_sp_first_value($_item + $_entry, ['order_id', 'reference_order_id'], '');
+                    $_orderItem = bv_sp_first_value($_item + $_entry, ['order_item_id', 'reference_order_item_id'], '');
+                    $_amount  = bv_sp_first_value($_item + $_entry, ['amount'], '');
+                    $_currency = bv_sp_first_value($_item + $_entry, ['currency'], 'USD');
+                    $_reason  = bv_sp_first_value($_item, ['reason', 'error'], '');
+                    $_status  = bv_sp_first_value($_entry, ['status', 'balance_status', 'entry_status'], '');
+                    $_result  = !empty($_item['error']) ? 'Error' : (!empty($_item['blocked']) ? 'Blocked' : ($_reason === 'dry_run_eligible' ? 'Eligible preview' : (!empty($_item['ok']) ? 'OK' : 'Not eligible')));
+                ?><tr>
+                    <td><?php echo h($_entryId ?: ''); ?></td>
+                    <td><?php echo h($_seller !== '' ? $_seller : '—'); ?></td>
+                    <td><?php echo h($_order !== '' ? $_order : '—'); ?></td>
+                    <td><?php echo h($_orderItem !== '' ? $_orderItem : '—'); ?></td>
+                    <td><?php echo h($_amount !== '' ? money_fmt($_amount, $_currency) : '—'); ?></td>
+                    <td><?php echo h(trim(($_status !== '' ? $_status : '') . ($_reason !== '' ? ' / ' . $_reason : '')) ?: '—'); ?></td>
+                    <td><span class="badge <?php echo h(status_badge_class($_result)); ?>"><?php echo h($_result); ?></span></td>
+                </tr><?php endforeach; ?>
+                </tbody></table></div>
+            <?php endif; ?>
+        <?php endif; ?>
+    </div>
+</div>
 
 <!-- Cards -->
 <div class="cards">
