@@ -658,9 +658,17 @@ if (!function_exists('bv_seller_release_run')) {
                 $entryId = _bv_seller_release_entry_id($entry);
                 $item = bv_seller_release_entry($pdo, $entryId, ['dry_run' => $dryRun] + $options);
                 $result['items'][] = $item;
+               $reason = trim((string)($item['reason'] ?? ''));
+                $isBlocked = !empty($item['blocked'])
+                    || (
+                        empty($item['released'])
+                        && empty($item['ok'])
+                        && !isset($item['errors'])
+                        && $reason !== ''
+                    );				
                 if (!empty($item['released'])) {
                     $result['released']++;
-                } elseif (!empty($item['blocked'])) {
+                } elseif ($isBlocked) { 
                     $result['blocked']++;
                 } elseif (!empty($item['error'])) {
                     $result['errors'][] = ['entry_id' => $entryId, 'error' => $item['error']];
