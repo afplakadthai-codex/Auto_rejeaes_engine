@@ -562,7 +562,7 @@ if (!function_exists('bv_seller_release_entry')) {
                 }
                 $eligibility = _bv_seller_release_entry_eligible($pdo, $entry, $options);
                 if (empty($eligibility['eligible'])) {
-                    return $base + ['blocked' => true, 'reason' => $eligibility['reason'] ?? 'blocked'];
+                  return array_replace($base, ['blocked' => true, 'reason' => $eligibility['reason'] ?? 'blocked']);
                 }
                 bv_seller_release_log('dry_run_release', ['entry_id' => $entryId, 'seller_id' => (int)($entry['seller_id'] ?? 0), 'amount' => (string)($entry['amount'] ?? '')]);
                 return $base + ['ok' => true, 'released' => true, 'reason' => 'dry_run_eligible'];
@@ -577,7 +577,7 @@ if (!function_exists('bv_seller_release_entry')) {
             $eligibility = _bv_seller_release_entry_eligible($pdo, $entry, $options);
             if (empty($eligibility['eligible'])) {
                 $pdo->rollBack();
-                return $base + ['blocked' => true, 'reason' => $eligibility['reason'] ?? 'blocked'];
+                return array_replace($base, ['blocked' => true, 'reason' => $eligibility['reason'] ?? 'blocked']);
             }
 
             $enum = _bv_seller_release_enum_values($pdo, 'seller_balance_entries', $statusCol);
@@ -608,7 +608,7 @@ if (!function_exists('bv_seller_release_entry')) {
             $stmt->execute($params);
            if ($stmt->rowCount() <= 0) {
                 $pdo->rollBack();
-                return $base + ['blocked' => true, 'reason' => 'stale_status_or_already_released'];
+                return array_replace($base, ['blocked' => true, 'reason' => 'stale_status_or_already_released']);
             }			
             $pdo->commit();
 			
