@@ -91,6 +91,55 @@ if (!function_exists('bv_seller_release_log')) {
     }
 }
 
+if (!function_exists('_bv_seller_release_balance_audit')) {
+    function _bv_seller_release_balance_audit(array $payload): void
+    {
+        $helpers = [
+            'bv_seller_balance_log',
+            'bv_seller_balance_audit_log',
+            'bv_seller_balance_add_audit',
+            'bv_seller_balance_entry_log',
+        ];
+
+        foreach ($helpers as $helper) {
+            if (!function_exists($helper)) {
+                continue;
+            }
+
+            try {
+                if ($helper === 'bv_seller_balance_log') {
+                    $helper((string)$payload['event'], $payload);
+                } else {
+                    $ref = new ReflectionFunction($helper);
+                    if ($ref->getNumberOfParameters() >= 2) {
+                        $helper((string)$payload['event'], $payload);
+                    } else {
+                        $helper($payload);
+                    }
+                }
+                return;
+            } catch (Throwable $e) {
+                try {
+                    bv_seller_release_log('audit_helper_failed', [
+                        'helper' => $helper,
+                        'entry_id' => (int)($payload['entry_id'] ?? 0),
+                        'error' => $e->getMessage(),
+                    ]);
+                } catch (Throwable $ignored) {
+                    error_log('seller_balance_release_audit_helper_failed ' . $helper . ': ' . $e->getMessage());
+                }
+            }
+        }
+
+        try {
+            bv_seller_release_log((string)$payload['event'], $payload);
+        } catch (Throwable $e) {
+            error_log('seller_balance_release_audit_fallback_failed: ' . $e->getMessage());
+        }
+    }
+}
+
+
 if (!function_exists('bv_seller_release_db')) {
     function bv_seller_release_db(): PDO
     {
@@ -553,13 +602,30 @@ if (!function_exists('bv_seller_release_entry')) {
             if (isset($cols['updated_at'])) {
                 $sets[] = '`updated_at` = NOW()';
             }
+           $oldStatus = (string)($entry[$statusCol] ?? '');			
             $params[] = $entryId;
+            $params[] = $oldStatus;			
 
-            $stmt = $pdo->prepare('UPDATE seller_balance_entries SET ' . implode(', ', $sets) . ' WHERE id = ? LIMIT 1');
+           $stmt = $pdo->prepare('UPDATE seller_balance_entries SET ' . implode(', ', $sets) . ' WHERE id = ? AND ' . _bv_seller_release_ident($statusCol) . ' = ? LIMIT 1');  
             $stmt->execute($params);
+           if ($stmt->rowCount() <= 0) {
+                $pdo->rollBack();
+                return $base + ['blocked' => true, 'reason' => 'stale_status_or_already_released'];
+            }			
             $pdo->commit();
-
+			
+           $auditPayload = [
+                'event' => 'auto_release_completed',
+                'entry_id' => $entryId,
+                'seller_id' => (int)($entry['seller_id'] ?? 0),
+                'amount' => (string)($entry['amount'] ?? ''),
+                'old_status' => $oldStatus,
+                'new_status' => $releaseStatus,
+                'source' => 'seller_balance_auto_release',
+                'dry_run' => false,
+            ];
             bv_seller_release_log('released', ['entry_id' => $entryId, 'seller_id' => (int)($entry['seller_id'] ?? 0), 'amount' => (string)($entry['amount'] ?? ''), 'status' => $releaseStatus]);
+            _bv_seller_release_balance_audit($auditPayload);			
             return $base + ['ok' => true, 'released' => true, 'status' => $releaseStatus];
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {

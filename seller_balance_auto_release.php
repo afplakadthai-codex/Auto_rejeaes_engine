@@ -3,9 +3,13 @@ declare(strict_types=1);
 
 require_once dirname(__DIR__) . '/includes/seller_balance_release_engine.php';
 
-header('Content-Type: application/json; charset=utf-8');
+
 
 $isCli = PHP_SAPI === 'cli';
+if (!$isCli && !headers_sent()) {
+    header('Content-Type: application/json; charset=utf-8');
+}
+
 $options = ['dry_run' => true];
 $realRunRequested = false;
 
