@@ -364,12 +364,10 @@ if (!function_exists('_bv_seller_release_item_ready')) {
     {
         $status = strtolower(trim((string)($item['fulfillment_status'] ?? '')));
         $completedAt = (string)($item['completed_at'] ?? '');
+        $hasFulfillmentStatusColumn = array_key_exists('fulfillment_status', $item);		
 
-        if (array_key_exists('fulfillment_status', $item) && $status !== '') {
-            if (in_array($status, ['cancelled', 'canceled', 'refunded', 'returned', 'failed'], true)) {
-                return false;
-            }
-            if ($status !== 'completed' && !_bv_seller_release_date_due($completedAt, $delayDays)) {
+        if ($hasFulfillmentStatusColumn) {
+            if ($status !== 'completed') {
                 return false;
             }
         }
